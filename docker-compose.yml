@@ -1,0 +1,151 @@
+# Docker Compose for Workflow Orchestration Engine
+# Single command: docker-compose up
+# To scale the worker, use: docker compose up -d --scale worker=N
+
+
+services:
+  # =============================================================================
+  # Infrastructure Services
+  # =============================================================================
+  
+  redis:
+    image: redis:7-alpine
+    container_name: workflow-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - workflow-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: workflow-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: workflow_engine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - workflow-network
+
+  # =============================================================================
+  # Application Services
+  # =============================================================================
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workflow_engine:/app/workflow_engine:ro
+    environment:
+      # Core settings
+      - ENVIRONMENT=dev
+      - DEBUG=true
+      - LOG_LEVEL=INFO
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=
+      # PostgreSQL
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DATABASE=workflow_engine
+      # Orchestrator
+      - ORCHESTRATOR_CHECKPOINT_INTERVAL=10.0
+      - ORCHESTRATOR_RECOVERY_TIMEOUT=60.0
+      - ORCHESTRATOR_STALE_CLAIM_INTERVAL=15.0
+      - ORCHESTRATOR_STALE_RESULT_TIMEOUT=30.0
+      # Retry
+      - RETRY_MAX_RETRIES=3
+      - RETRY_INITIAL_DELAY=1.0
+      - RETRY_MAX_DELAY=60.0
+      # Enable reload
+      - UVICORN_RELOAD=true
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - workflow-network
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["watchmedo", "auto-restart", "--directory=/app/workflow_engine", "--pattern=*.py", "--recursive", "--", "python", "-m", "workflow_engine.workers.unified"]
+    volumes:
+      - ./workflow_engine:/app/workflow_engine:ro
+    environment:
+      # Skip database migrations - only API service runs them
+      - SKIP_MIGRATIONS=true
+      # Core settings
+      - ENVIRONMENT=dev
+      - DEBUG=true
+      - LOG_LEVEL=INFO
+      # Redis (for task consumption, result publishing, and heartbeats)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=
+      # Worker settings
+      - WORKER_CONCURRENCY=10
+      - WORKER_HEARTBEAT_INTERVAL=5.0
+      - WORKER_HEARTBEAT_TIMEOUT=15.0
+      - WORKER_GRACEFUL_SHUTDOWN_TIMEOUT=180.0 # Match longest handler timeout
+      - WORKER_STALE_CLAIM_INTERVAL=30.0
+      # Stale message timeouts (per handler type)
+      # Time before claiming orphaned messages of dead workers from PEL 
+      # Should be > max expected task duration for each handler
+      - STALE_TIMEOUT_INPUT=30
+      - STALE_TIMEOUT_OUTPUT=30
+      - STALE_TIMEOUT_CALL_EXTERNAL_SERVICE=120
+      - STALE_TIMEOUT_LLM_SERVICE=180
+      - STALE_TIMEOUT_DEFAULT=120
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - workflow-network
+    restart: unless-stopped
+    stop_grace_period: 200s  # Must be > WORKER_GRACEFUL_SHUTDOWN_TIMEOUT. Docker waits 200s before force-killing, giving the worker 180s to finish in-flight tasks gracefully.
+    deploy:
+      replicas: 1
+
+
+networks:
+  workflow-network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  postgres_data:
