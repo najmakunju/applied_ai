@@ -61,6 +61,7 @@ A production-grade event-driven workflow orchestration engine with DAG-based tas
 Start all services with a single command:
 
 ```bash
+cd applied_ai
 docker-compose up
 ```
 
