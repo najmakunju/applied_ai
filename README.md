@@ -70,21 +70,22 @@ This starts:
 - **PostgreSQL**: localhost:5432
 - **Worker**: Processing tasks from queues
 
-### Scaling Orchestrators
+### Scaling Components
 
-Scale Orchestrators horizontally:
+Scale orchestrators and workers independently or together:
 
 ```bash
+# Scale orchestrators only
 docker compose up -d --scale api=3
-```
 
-### Scaling Workers
-
-Scale workers horizontally:
-
-```bash
+# Scale workers only
 docker compose up -d --scale worker=3
+
+# Scale both together
+docker compose up -d --scale api=2 --scale worker=2
 ```
+
+> **Note:** When scaling orchestrators, Docker assigns ports from the configured range (8000-8010). Use a load balancer in production for proper request distribution.
 
 ### API Documentation
 
@@ -95,6 +96,8 @@ Once running, access the API documentation at:
 ## Usage
 
 ### 1. Submit a Workflow
+
+Workflow submission creates a workflow definition and execution record in PENDING state:
 
 ```bash
 curl -X POST http://localhost:8000/v1/workflow \
@@ -137,10 +140,23 @@ Response:
 
 ### 2. Trigger Execution
 
+Trigger the workflow to start processing. This two-step approach allows:
+- Workflow definition validation before execution
+- Deferred execution with custom input parameters
+- Re-triggering the same workflow definition with different inputs
+
 ```bash
 curl -X POST http://localhost:8000/v1/workflow/trigger/6ba7b810-9dad-11d1-80b4-00c04fd430c8 \
   -H "Content-Type: application/json" \
   -d '{"input_params": {"user_id": 123}}'
+```
+
+Response:
+```json
+{
+  "execution_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+  "message": "Workflow started successfully"
+}
 ```
 
 ### 3. Check Status
@@ -370,8 +386,27 @@ These control how long a message can be pending before another worker claims it 
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/v1/workflow` | Submit a new workflow definition |
+| POST | `/v1/workflow` | Submit a new workflow definition (returns in PENDING state) |
 | POST | `/v1/workflow/trigger/{execution_id}` | Trigger workflow execution with optional input params |
 | GET | `/v1/workflows/{execution_id}` | Get workflow status and node states |
 | GET | `/v1/workflows/{execution_id}/results` | Get workflow output data |
 | GET | `/v1/health` | Health check (Redis, PostgreSQL, Orchestrator, Workers) |
+
+## Verified Test Scenarios
+
+The following scenarios have been tested and verified:
+
+### Scenario A: Linear Chain (A → B → C)
+Sequential execution where each node waits for its predecessor. Data flows correctly through the chain.
+
+### Scenario B: Fan-Out/Fan-In (A → B,C → D)
+- Node A triggers B and C in parallel (same millisecond dispatch)
+- Node D waits for BOTH B and C to complete
+- D receives aggregated results from both branches
+
+### Scenario C: Race Condition Handling
+When B and C complete within milliseconds of each other, the orchestrator correctly triggers D exactly once. No duplicate dispatches occur due to atomic Redis Lua script coordination.
+
+### Scaling Scenarios Tested
+- 1 Orchestrator + 1 Worker: Basic operation verified
+- 2 Orchestrators + 2 Workers: Horizontal scaling verified

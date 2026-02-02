@@ -183,7 +183,13 @@ class TemplateResolver:
         return self._navigate_path(root, path)
     
     def _navigate_path(self, value: Any, path: list) -> Any:
-        """Navigate a path through nested data structures."""
+        """
+        Navigate a path through nested data structures.
+        
+        Security: Only dict-based navigation and list indexing are allowed.
+        No attribute access (getattr) to prevent potential security issues
+        like accessing object methods or private attributes.
+        """
         current = value
         
         for key in path:
@@ -199,8 +205,10 @@ class TemplateResolver:
             elif isinstance(current, dict):
                 current = current.get(key)
             else:
-                # Try attribute access for objects
-                current = getattr(current, key, None)
+                # Security: Do NOT use getattr() to avoid accessing object
+                # methods or private attributes. Only dict/list navigation
+                # is allowed for template resolution.
+                return None
         
         return current
 

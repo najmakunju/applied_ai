@@ -34,6 +34,16 @@ class RedisSettings(BaseSettings):
     socket_connect_timeout: float = Field(default=5.0, description="Connection timeout")
     stream_block_ms: int = Field(default=5000, description="XREADGROUP block time in ms (must be < socket_timeout)")
     
+    # Stream trimming settings to prevent unbounded growth
+    stream_max_length: int = Field(
+        default=10000, 
+        description="Maximum stream length before trimming (approximate)"
+    )
+    stream_trim_interval: float = Field(
+        default=300.0, 
+        description="How often to trim streams (seconds). Default: 5 minutes"
+    )
+    
     @property
     def url(self) -> str:
         """Generate Redis connection URL."""
@@ -109,6 +119,38 @@ class StaleMessageTimeouts(BaseSettings):
         return int(timeout_seconds * 1000)
 
 
+class HandlerTimeouts(BaseSettings):
+    """
+    Per-handler task execution timeouts.
+    
+    These define the maximum time a task can run before being cancelled.
+    Should be set based on expected task duration + buffer.
+    """
+    
+    model_config = SettingsConfigDict(env_prefix="HANDLER_TIMEOUT_")
+    
+    # Fast handlers - short timeout
+    input: float = Field(default=30.0, description="Input handler timeout (seconds)")
+    output: float = Field(default=30.0, description="Output handler timeout (seconds)")
+    
+    # Slower handlers - longer timeout
+    call_external_service: float = Field(
+        default=60.0, 
+        description="External service handler timeout (seconds)"
+    )
+    llm_service: float = Field(
+        default=120.0, 
+        description="LLM service handler timeout (seconds)"
+    )
+    
+    # Fallback for unknown handler types
+    default: float = Field(default=60.0, description="Default handler timeout (seconds)")
+    
+    def get_timeout(self, handler_type: str) -> float:
+        """Get timeout in seconds for a handler type."""
+        return getattr(self, handler_type, self.default)
+
+
 class WorkerSettings(BaseSettings):
     """Worker configuration settings."""
     
@@ -122,6 +164,9 @@ class WorkerSettings(BaseSettings):
     
     # Per-handler stale message timeouts
     stale_timeouts: StaleMessageTimeouts = Field(default_factory=StaleMessageTimeouts)
+    
+    # Per-handler task execution timeouts
+    handler_timeouts: HandlerTimeouts = Field(default_factory=HandlerTimeouts)
 
 
 class OrchestratorSettings(BaseSettings):

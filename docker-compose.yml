@@ -2,6 +2,7 @@
 # Single command: docker-compose up
 # To scale the worker, use: docker compose up -d --scale worker=N
 # To scale the orchestrator, use: docker compose up -d --scale api=N
+# To scale both , use docker compose up -d --scale api=2 --scale worker=2
 
 
 services:

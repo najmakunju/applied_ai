@@ -257,6 +257,52 @@ class TaskQueue:
             retried += 1
         
         return retried
+    
+    async def trim_stream(self, max_length: Optional[int] = None) -> int:
+        """
+        Trim the stream to prevent unbounded growth.
+        
+        Uses approximate trimming for better performance.
+        
+        Args:
+            max_length: Maximum stream length. If not provided, uses settings.
+            
+        Returns:
+            Number of entries removed (approximate).
+        """
+        if max_length is None:
+            max_length = self.settings.redis.stream_max_length
+        
+        try:
+            # Get current length
+            current_length = await self.client.xlen(self.stream_key)
+            
+            if current_length <= max_length:
+                return 0
+            
+            # Trim to max_length (approximate for performance)
+            await self.client.xtrim(
+                self.stream_key,
+                maxlen=max_length,
+                approximate=True,
+            )
+            
+            new_length = await self.client.xlen(self.stream_key)
+            trimmed = current_length - new_length
+            
+            if trimmed > 0:
+                from logging import getLogger
+                getLogger(__name__).debug(
+                    f"Trimmed {trimmed} entries from {self.stream_key} "
+                    f"(was {current_length}, now {new_length})"
+                )
+            
+            return trimmed
+            
+        except redis.ResponseError as e:
+            from logging import getLogger
+            getLogger(__name__).warning(f"Failed to trim stream {self.stream_key}: {e}")
+            return 0
 
 
 class ResultQueue:
@@ -418,6 +464,52 @@ class ResultQueue:
             
         except redis.ResponseError:
             return []
+    
+    async def trim_stream(self, max_length: Optional[int] = None) -> int:
+        """
+        Trim the results stream to prevent unbounded growth.
+        
+        Uses approximate trimming for better performance.
+        
+        Args:
+            max_length: Maximum stream length. If not provided, uses settings.
+            
+        Returns:
+            Number of entries removed (approximate).
+        """
+        if max_length is None:
+            max_length = self.settings.redis.stream_max_length
+        
+        try:
+            # Get current length
+            current_length = await self.client.xlen(self.STREAM_KEY)
+            
+            if current_length <= max_length:
+                return 0
+            
+            # Trim to max_length (approximate for performance)
+            await self.client.xtrim(
+                self.STREAM_KEY,
+                maxlen=max_length,
+                approximate=True,
+            )
+            
+            new_length = await self.client.xlen(self.STREAM_KEY)
+            trimmed = current_length - new_length
+            
+            if trimmed > 0:
+                from logging import getLogger
+                getLogger(__name__).debug(
+                    f"Trimmed {trimmed} entries from results stream "
+                    f"(was {current_length}, now {new_length})"
+                )
+            
+            return trimmed
+            
+        except redis.ResponseError as e:
+            from logging import getLogger
+            getLogger(__name__).warning(f"Failed to trim results stream: {e}")
+            return 0
 
 
 class MessageBroker:
@@ -487,3 +579,29 @@ class MessageBroker:
             }
         
         return stats
+    
+    async def trim_all_streams(self, max_length: Optional[int] = None) -> dict[str, int]:
+        """
+        Trim all task and result streams to prevent unbounded growth.
+        
+        Args:
+            max_length: Maximum stream length. If not provided, uses settings.
+            
+        Returns:
+            Dict mapping stream key to number of entries trimmed.
+        """
+        trimmed = {}
+        
+        # Trim task queues
+        for key, queue in self._queues.items():
+            count = await queue.trim_stream(max_length)
+            if count > 0:
+                trimmed[queue.stream_key] = count
+        
+        # Trim result queue
+        if self._result_queue:
+            count = await self._result_queue.trim_stream(max_length)
+            if count > 0:
+                trimmed[self._result_queue.STREAM_KEY] = count
+        
+        return trimmed

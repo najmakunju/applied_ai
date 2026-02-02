@@ -2,6 +2,7 @@
 Task handlers for different node types.
 
 Implements mock handlers for External Service and LLM nodes.
+All handlers have timeout protection to prevent tasks from hanging indefinitely.
 """
 
 import asyncio
@@ -11,10 +12,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from workflow_engine.config import get_settings
 from workflow_engine.core.models import HandlerType, TaskResult
 from workflow_engine.workers.base import BaseWorker
 
 logger = logging.getLogger(__name__)
+
+
+class TaskTimeoutError(Exception):
+    """Raised when a task exceeds its timeout."""
+    pass
 
 
 class InputHandler(BaseWorker):
@@ -89,6 +96,7 @@ class ExternalServiceHandler(BaseWorker):
     Handler for external service calls.
     
     Mocks HTTP calls by sleeping for 1-2 seconds and returning dummy JSON.
+    Includes timeout protection to prevent hanging tasks.
     """
     
     def __init__(self, worker_id: str | None = None):
@@ -96,9 +104,10 @@ class ExternalServiceHandler(BaseWorker):
             worker_id=worker_id or f"external-worker-{uuid.uuid4().hex[:8]}",
             capabilities=[HandlerType.CALL_EXTERNAL_SERVICE.value],
         )
+        self._settings = get_settings()
     
     async def process_task(self, task_data: dict[str, Any]) -> TaskResult:
-        """Mock external service call."""
+        """Mock external service call with timeout protection."""
         started_at = datetime.utcnow()
         
         config = task_data.get("config", {})
@@ -109,12 +118,33 @@ class ExternalServiceHandler(BaseWorker):
         
         logger.info(f"Processing external service node: {node_id}, URL: {url}")
         
-        # Simulate network latency (1-2 seconds as per spec)
-        delay = random.uniform(1.0, 2.0)
-        await asyncio.sleep(delay)
+        # Get timeout for this handler type
+        timeout = self._settings.worker.handler_timeouts.get_timeout("call_external_service")
         
-        # Generate mock response based on URL/node
-        mock_response = self._generate_mock_response(node_id, url)
+        try:
+            # Wrap the actual work in a timeout to prevent hanging
+            async with asyncio.timeout(timeout):
+                # Simulate network latency (1-2 seconds as per spec)
+                delay = random.uniform(1.0, 2.0)
+                await asyncio.sleep(delay)
+                
+                # Generate mock response based on URL/node
+                mock_response = self._generate_mock_response(node_id, url)
+        except asyncio.TimeoutError:
+            duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+            logger.error(f"External service task {node_id} timed out after {timeout}s")
+            return TaskResult(
+                task_message_id=uuid.UUID(task_data["id"]),
+                node_execution_id=uuid.UUID(task_data["node_execution_id"]),
+                workflow_execution_id=uuid.UUID(task_data["workflow_execution_id"]),
+                worker_id=self.worker_id,
+                success=False,
+                error_message=f"Task timed out after {timeout} seconds",
+                error_type="TaskTimeoutError",
+                is_retryable=True,
+                started_at=started_at,
+                duration_ms=duration_ms,
+            )
         
         duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
         
@@ -183,6 +213,7 @@ class LLMServiceHandler(BaseWorker):
     Handler for LLM service calls.
     
     Mocks AI generation by accepting a prompt and returning a mock response.
+    Includes timeout protection to prevent hanging tasks.
     """
     
     def __init__(self, worker_id: str | None = None):
@@ -190,9 +221,10 @@ class LLMServiceHandler(BaseWorker):
             worker_id=worker_id or f"llm-worker-{uuid.uuid4().hex[:8]}",
             capabilities=[HandlerType.LLM_SERVICE.value],
         )
+        self._settings = get_settings()
     
     async def process_task(self, task_data: dict[str, Any]) -> TaskResult:
-        """Mock LLM service call."""
+        """Mock LLM service call with timeout protection."""
         started_at = datetime.utcnow()
         
         config = task_data.get("config", {})
@@ -206,12 +238,33 @@ class LLMServiceHandler(BaseWorker):
         
         logger.info(f"Processing LLM node: {node_id}, model: {model}")
         
-        # Simulate LLM processing time (1-3 seconds)
-        delay = random.uniform(1.0, 3.0)
-        await asyncio.sleep(delay)
+        # Get timeout for this handler type
+        timeout = self._settings.worker.handler_timeouts.get_timeout("llm_service")
         
-        # Generate mock LLM response
-        mock_response = self._generate_mock_llm_response(prompt, input_data)
+        try:
+            # Wrap the actual work in a timeout to prevent hanging
+            async with asyncio.timeout(timeout):
+                # Simulate LLM processing time (1-3 seconds)
+                delay = random.uniform(1.0, 3.0)
+                await asyncio.sleep(delay)
+                
+                # Generate mock LLM response
+                mock_response = self._generate_mock_llm_response(prompt, input_data)
+        except asyncio.TimeoutError:
+            duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+            logger.error(f"LLM service task {node_id} timed out after {timeout}s")
+            return TaskResult(
+                task_message_id=uuid.UUID(task_data["id"]),
+                node_execution_id=uuid.UUID(task_data["node_execution_id"]),
+                workflow_execution_id=uuid.UUID(task_data["workflow_execution_id"]),
+                worker_id=self.worker_id,
+                success=False,
+                error_message=f"Task timed out after {timeout} seconds",
+                error_type="TaskTimeoutError",
+                is_retryable=True,
+                started_at=started_at,
+                duration_ms=duration_ms,
+            )
         
         duration_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
         

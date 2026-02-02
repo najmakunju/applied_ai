@@ -129,6 +129,7 @@ class WorkflowOrchestrator:
         # Start checkpoint task if database is available
         if self.database:
             self._checkpoint_task = asyncio.create_task(self._checkpoint_loop())
+        
     
     async def stop(self) -> None:
         """Stop the orchestrator gracefully."""
@@ -417,6 +418,15 @@ class WorkflowOrchestrator:
         """Dispatch a node for execution."""
         node_exec = execution.node_executions[node.id]
         
+        # Validate state transition before dispatch (Bug #3)
+        current_state = NodeState(node_exec.state)
+        if not NodeStateMachine(current_state).can_transition_to(NodeState.QUEUED):
+            logger.warning(
+                f"Cannot dispatch node {node.id} from state {current_state.value}. "
+                f"Valid transitions: {NodeStateMachine(current_state).get_valid_transitions()}"
+            )
+            return
+        
         # Transition to QUEUED
         node_exec.state = NodeState.QUEUED.value
         
@@ -482,27 +492,35 @@ class WorkflowOrchestrator:
     async def _ensure_execution_loaded(
         self,
         workflow_execution_id: UUID,
+        force_refresh: bool = False,
     ) -> tuple[Optional[WorkflowExecution], Optional[WorkflowDefinition]]:
         """
         Ensure workflow execution is loaded in memory.
         
         Tries to load from:
-        1. In-memory cache
+        1. In-memory cache (skipped if force_refresh=True)
         2. Redis cache
         3. PostgreSQL database (if configured)
         
+        Args:
+            workflow_execution_id: The workflow execution ID to load
+            force_refresh: If True, skip in-memory cache and load fresh from Redis.
+                          Use this when handling results to avoid stale state in
+                          multi-orchestrator deployments.
+        
         Returns tuple of (execution, definition) or (None, None) if not found.
         """
-        # Check in-memory first
-        execution = self._active_executions.get(workflow_execution_id)
-        if execution:
-            definition = self._workflow_definitions.get(execution.workflow_definition_id)
-            return execution, definition
+        # Check in-memory first (unless force_refresh is requested)
+        if not force_refresh:
+            execution = self._active_executions.get(workflow_execution_id)
+            if execution:
+                definition = self._workflow_definitions.get(execution.workflow_definition_id)
+                return execution, definition
         
         # Try to load from Redis cache
         cached = await self.cache.get_workflow_execution(workflow_execution_id)
         if cached:
-            logger.info(f"Loading execution {workflow_execution_id} from Redis cache")
+            logger.debug(f"Loading execution {workflow_execution_id} from Redis cache")
             
             # Reconstruct execution from cached data
             execution = WorkflowExecution(
@@ -614,8 +632,12 @@ class WorkflowOrchestrator:
             output_data: Node output data
             worker_id: Worker that processed the node
         """
-        # Ensure execution is loaded (from memory, cache, or DB)
-        execution, definition = await self._ensure_execution_loaded(workflow_execution_id)
+        # Force refresh from Redis to avoid stale state in multi-orchestrator deployments.
+        # Without this, an orchestrator might have an outdated in-memory cache and
+        # overwrite another orchestrator's updates when caching back to Redis.
+        execution, definition = await self._ensure_execution_loaded(
+            workflow_execution_id, force_refresh=True
+        )
         
         if not execution:
             logger.error(
@@ -634,6 +656,29 @@ class WorkflowOrchestrator:
         node_exec = execution.node_executions.get(node_id)
         if not node_exec:
             logger.warning(f"Node execution not found: {node_id}")
+            return
+        
+        # Idempotency check: Skip if node is already completed.
+        # This prevents race conditions in multi-orchestrator deployments where
+        # the same result might be processed by multiple orchestrators, and a
+        # slower orchestrator might overwrite the state with stale data.
+        if node_exec.state == NodeState.COMPLETED.value:
+            logger.info(
+                f"Node {node_id} already completed for execution {workflow_execution_id}, "
+                "skipping duplicate result"
+            )
+            return
+        
+        # Also skip if workflow is already in a terminal state
+        if execution.state in (
+            WorkflowState.COMPLETED.value,
+            WorkflowState.FAILED.value,
+            WorkflowState.CANCELLED.value,
+        ):
+            logger.info(
+                f"Workflow {workflow_execution_id} already in terminal state "
+                f"({execution.state}), skipping node {node_id} completion"
+            )
             return
         
         # Update node state
@@ -699,8 +744,10 @@ class WorkflowOrchestrator:
             is_retryable: Whether the error was retryable (for logging only)
             worker_id: ID of the worker that processed the task
         """
-        # Ensure execution is loaded (from memory, cache, or DB)
-        execution, definition = await self._ensure_execution_loaded(workflow_execution_id)
+        # Force refresh from Redis to avoid stale state in multi-orchestrator deployments.
+        execution, definition = await self._ensure_execution_loaded(
+            workflow_execution_id, force_refresh=True
+        )
         
         if not execution:
             logger.error(
@@ -719,6 +766,27 @@ class WorkflowOrchestrator:
         node_exec = execution.node_executions.get(node_id)
         if not node_exec:
             logger.warning(f"Node execution not found: {node_id}")
+            return
+        
+        # Idempotency check: Skip if node is already in a terminal state.
+        # This prevents race conditions in multi-orchestrator deployments.
+        if node_exec.state in (NodeState.COMPLETED.value, NodeState.FAILED.value):
+            logger.info(
+                f"Node {node_id} already in terminal state ({node_exec.state}) for "
+                f"execution {workflow_execution_id}, skipping duplicate failure result"
+            )
+            return
+        
+        # Also skip if workflow is already in a terminal state
+        if execution.state in (
+            WorkflowState.COMPLETED.value,
+            WorkflowState.FAILED.value,
+            WorkflowState.CANCELLED.value,
+        ):
+            logger.info(
+                f"Workflow {workflow_execution_id} already in terminal state "
+                f"({execution.state}), skipping node {node_id} failure"
+            )
             return
         
         # Mark node as failed
@@ -845,8 +913,8 @@ class WorkflowOrchestrator:
             # Persist final state to database immediately
             await self._persist_workflow_completion(execution)
             
-            # Cleanup: remove from in-memory and Redis cache
-            await self._cleanup_completed_workflow(execution)
+            # Cleanup: remove from in-memory and Redis cache, clean up fan-in counters
+            await self._cleanup_completed_workflow(execution, definition)
             
             logger.info(
                 f"Workflow {execution.id} completed with state: {computed_state.value}"
@@ -891,13 +959,16 @@ class WorkflowOrchestrator:
     async def _cleanup_completed_workflow(
         self,
         execution: WorkflowExecution,
+        definition: Optional[WorkflowDefinition] = None,
     ) -> None:
         """
         Cleanup resources after workflow completion.
         
         Removes workflow from:
         - In-memory active executions dict
+        - In-memory workflow definitions dict (to prevent memory leak)
         - Redis cache
+        - Fan-in counters in Redis
         
         The workflow data remains in PostgreSQL for historical queries.
         """
@@ -907,9 +978,36 @@ class WorkflowOrchestrator:
                 del self._active_executions[execution.id]
                 logger.debug(f"Removed workflow {execution.id} from active executions")
             
+            # Clean up workflow definition from memory (Bug #2: prevent memory leak)
+            # Only clean up if there are no other active executions using this definition
+            if execution.workflow_definition_id in self._workflow_definitions:
+                has_other_executions = any(
+                    exec.workflow_definition_id == execution.workflow_definition_id
+                    for exec in self._active_executions.values()
+                )
+                if not has_other_executions:
+                    del self._workflow_definitions[execution.workflow_definition_id]
+                    self._dag_parsers.pop(execution.workflow_definition_id, None)
+                    logger.debug(
+                        f"Removed workflow definition {execution.workflow_definition_id} "
+                        "from memory (no active executions)"
+                    )
+            
             # Remove from Redis cache
             await self.cache.delete_workflow_execution(execution.id)
             logger.debug(f"Removed workflow {execution.id} from Redis cache")
+            
+            # Clean up fan-in counters in Redis (Loophole #4)
+            # Get definition if not passed
+            if definition is None:
+                definition = self._workflow_definitions.get(execution.workflow_definition_id)
+            
+            if definition:
+                for node in definition.dag.nodes:
+                    if len(node.dependencies) > 1:
+                        # This is a fan-in node, clean up its counter and outputs
+                        await self.fan_in_coordinator.cleanup(execution.id, node.id)
+                        logger.debug(f"Cleaned up fan-in state for node {node.id}")
             
         except Exception as e:
             # Log but don't fail - cleanup is best-effort
@@ -1224,6 +1322,10 @@ class WorkflowOrchestrator:
         
         These nodes may have been picked up by workers that died, or the
         messages may have been lost.
+        
+        IMPORTANT: Always verify dependencies are complete before re-dispatching,
+        regardless of whether it's a fan-in node or not. This prevents incorrect
+        re-dispatch of nodes whose dependencies haven't completed yet.
         """
         stuck_states = {NodeState.QUEUED.value, NodeState.RUNNING.value}
         
@@ -1235,15 +1337,17 @@ class WorkflowOrchestrator:
             if not node:
                 continue
             
-            logger.info(f"Recovery: Re-dispatching stuck node {node_id} (was {node_exec.state})")
+            logger.info(f"Recovery: Examining stuck node {node_id} (was {node_exec.state})")
             
             # Reset to PENDING and increment attempt
             node_exec.state = NodeState.PENDING.value
             node_exec.attempt += 1
             
-            # Check if this is a fan-in node - ensure counter is recovered first
-            if len(node.dependencies) > 1:
-                # For fan-in nodes, check if all dependencies are complete
+            # Check if ALL dependencies are complete before re-dispatching.
+            # This applies to ALL nodes (not just fan-in), to prevent dispatching
+            # a node before its dependencies have completed (which could happen
+            # if state was corrupted or loaded from stale cache).
+            if node.dependencies:
                 all_deps_complete = all(
                     execution.node_executions.get(dep_id, NodeExecution(
                         node_id=dep_id, 
@@ -1253,12 +1357,20 @@ class WorkflowOrchestrator:
                 )
                 
                 if not all_deps_complete:
+                    incomplete_deps = [
+                        dep_id for dep_id in node.dependencies
+                        if execution.node_executions.get(dep_id, NodeExecution(
+                            node_id=dep_id,
+                            workflow_execution_id=execution.id
+                        )).state != NodeState.COMPLETED.value
+                    ]
                     logger.info(
-                        f"Recovery: Fan-in node {node_id} waiting for dependencies"
+                        f"Recovery: Node {node_id} waiting for dependencies: {incomplete_deps}"
                     )
                     continue
             
             # Re-dispatch
+            logger.info(f"Recovery: Re-dispatching stuck node {node_id}")
             await self._dispatch_node(execution, definition, node)
     
     # ==================== Checkpointing ====================
@@ -1345,22 +1457,16 @@ class WorkflowOrchestrator:
         self,
         execution_id: UUID,
     ) -> Optional[dict[str, Any]]:
-        """Get current workflow status."""
-        # Check in-memory first (active workflows)
-        execution = self._active_executions.get(execution_id)
-        if execution:
-            return {
-                "id": str(execution.id),
-                "state": execution.state,
-                "started_at": execution.started_at.isoformat() if execution.started_at else None,
-                "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
-                "node_states": {
-                    node_id: node_exec.state
-                    for node_id, node_exec in execution.node_executions.items()
-                },
-            }
+        """
+        Get current workflow status.
         
-        # Check Redis cache (active workflows)
+        Checks Redis first (shared source of truth in multi-orchestrator deployments),
+        then falls back to PostgreSQL for completed/historical workflows.
+        
+        Note: In-memory cache is intentionally NOT checked first because it may be
+        stale when another orchestrator processed the workflow completion.
+        """
+        # Check Redis cache first (shared source of truth for active workflows)
         cached = await self.cache.get_workflow_execution(execution_id)
         if cached:
             return {
@@ -1374,7 +1480,7 @@ class WorkflowOrchestrator:
                 },
             }
         
-        # Check PostgreSQL (completed/historical workflows)
+        # Check PostgreSQL (completed/historical workflows - cleaned up from Redis)
         if self.database:
             async with self.database.session() as session:
                 repo = WorkflowRepository(session)
@@ -1397,18 +1503,16 @@ class WorkflowOrchestrator:
         self,
         execution_id: UUID,
     ) -> Optional[dict[str, Any]]:
-        """Get workflow execution results."""
-        # Check in-memory first (active workflows)
-        execution = self._active_executions.get(execution_id)
-        if execution:
-            return {
-                "id": str(execution.id),
-                "state": execution.state,
-                "output_data": execution.output_data,
-                "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
-            }
+        """
+        Get workflow execution results.
         
-        # Check Redis cache (active workflows)
+        Checks Redis first (shared source of truth in multi-orchestrator deployments),
+        then falls back to PostgreSQL for completed/historical workflows.
+        
+        Note: In-memory cache is intentionally NOT checked first because it may be
+        stale when another orchestrator processed the workflow completion.
+        """
+        # Check Redis cache first (shared source of truth for active workflows)
         cached = await self.cache.get_workflow_execution(execution_id)
         if cached:
             return {
@@ -1418,7 +1522,7 @@ class WorkflowOrchestrator:
                 "completed_at": cached.get("completed_at"),
             }
         
-        # Check PostgreSQL (completed/historical workflows)
+        # Check PostgreSQL (completed/historical workflows - cleaned up from Redis)
         if self.database:
             async with self.database.session() as session:
                 repo = WorkflowRepository(session)

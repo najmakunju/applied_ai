@@ -39,6 +39,44 @@ else
 end
 """
 
+# Lua script for atomic check-and-recover
+# Prevents race condition where multiple orchestrators try to recover the same counter
+# Returns: [was_recovered (0 or 1), remaining_count]
+FAN_IN_CHECK_AND_RECOVER_SCRIPT = """
+local counter_key = KEYS[1]
+local outputs_key = KEYS[2]
+local remaining = tonumber(ARGV[1])
+local num_outputs = tonumber(ARGV[2])
+
+-- Atomic check: if counter exists, return current value without modifying
+local exists = redis.call("EXISTS", counter_key)
+if exists == 1 then
+    local current = redis.call("GET", counter_key)
+    return {0, tonumber(current) or 0}  -- Not recovered, return current value
+end
+
+-- Counter doesn't exist - atomically initialize it
+-- Use SETNX to ensure only one caller wins the race
+local set_result = redis.call("SETNX", counter_key, remaining)
+if set_result == 0 then
+    -- Another caller won the race, get their value
+    local current = redis.call("GET", counter_key)
+    return {0, tonumber(current) or 0}  -- Not recovered by us
+end
+
+-- We won the race - store the outputs
+-- Outputs are passed as pairs: dep_id1, output1, dep_id2, output2, ...
+for i = 1, num_outputs do
+    local dep_id = ARGV[2 + (i - 1) * 2 + 1]
+    local output = ARGV[2 + (i - 1) * 2 + 2]
+    if dep_id and output then
+        redis.call("HSET", outputs_key, dep_id, output)
+    end
+end
+
+return {1, remaining}  -- Was recovered by us
+"""
+
 
 class FanInCoordinator:
     """
@@ -54,10 +92,14 @@ class FanInCoordinator:
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
         self._decrement_script: Optional[str] = None
+        self._check_and_recover_script: Optional[str] = None
     
     async def init(self) -> None:
         """Initialize Lua scripts."""
         self._decrement_script = self.redis.register_script(FAN_IN_DECREMENT_SCRIPT)
+        self._check_and_recover_script = self.redis.register_script(
+            FAN_IN_CHECK_AND_RECOVER_SCRIPT
+        )
     
     def _counter_key(self, workflow_execution_id: UUID, node_id: str) -> str:
         """Get Redis key for fan-in counter."""
@@ -241,10 +283,10 @@ class FanInCoordinator:
         completed_outputs: dict[str, dict[str, Any]],
     ) -> tuple[bool, int]:
         """
-        Check if counter exists, recover if missing.
+        Atomically check if counter exists, recover if missing.
         
-        This is a safe method to call before dependency_completed() to ensure
-        the counter is properly initialized.
+        Uses a Lua script to prevent race conditions where multiple orchestrators
+        or concurrent result processors try to recover the same counter simultaneously.
         
         Args:
             workflow_execution_id: Workflow execution ID
@@ -256,29 +298,47 @@ class FanInCoordinator:
         Returns:
             Tuple of (was_recovered, remaining_count)
         """
+        # Ensure scripts are initialized
+        if self._check_and_recover_script is None:
+            await self.init()
+        
         counter_key = self._counter_key(workflow_execution_id, node_id)
+        outputs_key = self._outputs_key(workflow_execution_id, node_id)
         
-        # Check if counter exists
-        exists = await self.redis.exists(counter_key)
+        # Calculate remaining count
+        remaining = total_dependencies - len(completed_dependency_ids)
+        if remaining < 0:
+            logger.warning(
+                f"Recovery: More completed deps ({len(completed_dependency_ids)}) "
+                f"than total ({total_dependencies}) for node {node_id}"
+            )
+            remaining = 0
         
-        if exists:
-            value = await self.redis.get(counter_key)
-            return False, int(value) if value else 0
+        # Flatten outputs for Lua script: [dep_id1, output1, dep_id2, output2, ...]
+        output_args = []
+        for dep_id, output in completed_outputs.items():
+            output_args.append(dep_id)
+            output_args.append(json.dumps(output))
         
-        # Counter missing - recover from node states
-        logger.warning(
-            f"Fan-in counter missing for {node_id}, recovering from persisted state"
+        # Execute atomic check-and-recover
+        # KEYS: [counter_key, outputs_key]
+        # ARGV: [remaining, num_outputs, dep_id1, output1, dep_id2, output2, ...]
+        result = await self._check_and_recover_script(
+            keys=[counter_key, outputs_key],
+            args=[remaining, len(completed_outputs)] + output_args,
         )
         
-        remaining = await self.recover_fan_in_state(
-            workflow_execution_id,
-            node_id,
-            total_dependencies,
-            completed_dependency_ids,
-            completed_outputs,
-        )
+        was_recovered = result[0] == 1
+        current_remaining = result[1]
         
-        return True, remaining
+        if was_recovered:
+            logger.warning(
+                f"Fan-in counter missing for {node_id}, recovered from persisted state: "
+                f"{len(completed_dependency_ids)}/{total_dependencies} complete, "
+                f"{current_remaining} remaining"
+            )
+        
+        return was_recovered, current_remaining
     
     async def is_counter_initialized(
         self,

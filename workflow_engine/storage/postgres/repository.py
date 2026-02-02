@@ -189,12 +189,20 @@ class WorkflowRepository:
         error_type: Optional[str] = None,
         error_stack_trace: Optional[str] = None,
     ) -> None:
-        """Update node execution state."""
+        """
+        Update node execution state.
+        
+        Note: This method will NOT downgrade terminal states (COMPLETED, FAILED, CANCELLED).
+        If the node is already in a terminal state in the database, the update will be
+        skipped to prevent race conditions in multi-orchestrator deployments.
+        """
+        terminal_states = ("COMPLETED", "FAILED", "CANCELLED")
+        
         values: dict[str, Any] = {"state": new_state}
         
         if new_state == "RUNNING":
             values["started_at"] = datetime.utcnow()
-        elif new_state in ("COMPLETED", "FAILED", "CANCELLED"):
+        elif new_state in terminal_states:
             values["completed_at"] = datetime.utcnow()
         
         if worker_id:
@@ -208,11 +216,32 @@ class WorkflowRepository:
         if error_stack_trace:
             values["error_stack_trace"] = error_stack_trace
         
-        await self.session.execute(
-            update(NodeExecutionModel)
-            .where(NodeExecutionModel.id == node_execution_id)
-            .values(**values)
-        )
+        # Build WHERE clause to prevent race conditions in multi-orchestrator deployments.
+        # 
+        # Rules:
+        # 1. If new_state is terminal: Always allow (first to complete wins, subsequent are idempotent)
+        # 2. If new_state is non-terminal: Only allow if DB state is also non-terminal
+        #    (prevents downgrading COMPLETED → QUEUED from stale checkpoint)
+        if new_state in terminal_states:
+            # Always allow terminal state updates (idempotent)
+            await self.session.execute(
+                update(NodeExecutionModel)
+                .where(NodeExecutionModel.id == node_execution_id)
+                .values(**values)
+            )
+        else:
+            # Non-terminal update: only if DB state is not already terminal
+            await self.session.execute(
+                update(NodeExecutionModel)
+                .where(
+                    and_(
+                        NodeExecutionModel.id == node_execution_id,
+                        # Only update if current DB state is NOT terminal
+                        NodeExecutionModel.state.notin_(terminal_states),
+                    )
+                )
+                .values(**values)
+            )
     
     # ==================== Helper Methods ====================
     
