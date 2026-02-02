@@ -70,6 +70,14 @@ This starts:
 - **PostgreSQL**: localhost:5432
 - **Worker**: Processing tasks from queues
 
+### Scaling Orchestrators
+
+Scale Orchestrators horizontally:
+
+```bash
+docker compose up -d --scale api=3
+```
+
 ### Scaling Workers
 
 Scale workers horizontally:

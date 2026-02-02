@@ -353,8 +353,7 @@ start() → _drain_pending_results() → _recover_incomplete_workflows() → sta
 | Approach | Pros | Cons |
 |----------|------|------|
 | **Lua scripts (chosen)** | Truly atomic, no race window | Lua learning curve, debugging harder |
-| MULTI/EXEC transactions | Familiar Redis commands | Not atomic (optimistic locking), can fail |
-| Distributed locks | Works for any operation | High overhead, deadlock risk |
+
 
 **Decision**: Lua scripts for atomic fan-in coordination. The counter decrement must be atomic with the zero-check.
 
@@ -427,12 +426,61 @@ start() → _drain_pending_results() → _recover_incomplete_workflows() → sta
 - **Audit trail**: Track changes to workflow definitions over time
 - **A/B testing**: Run different versions of a workflow simultaneously
 
-**Potential Implementation**:
-- Add version column to workflow_definitions with unique constraint on (name, version)
-- Auto-increment version when submitting a workflow with an existing name
-- Store workflow_version in executions to track which version was used
-- Add API endpoints for version management
-- Support aliases (e.g., "latest", "stable") pointing to specific versions
+
+### Rate Limiting
+
+**Current State**: No rate limiting is implemented. Workers process tasks as fast as they can consume from queues.
+
+**Future Enhancement**: Consider implementing rate limiting to:
+- **Protect external services**: Prevent overwhelming third-party APIs with too many concurrent requests
+- **Resource management**: Control system load during traffic spikes
+- **Fair usage**: Ensure no single workflow monopolizes system resources
+- **Cost control**: Limit expensive operations (e.g., LLM API calls) to manage costs
+
+
+### Horizontal Scaling
+
+**Current State**: Both orchestrator and workers are designed to be horizontally scalable.
+
+**Workers**:
+- Workers are stateless and can be scaled horizontally by running multiple instances
+- Redis Streams consumer groups ensure each task is delivered to only one worker
+- No coordination required between worker instances
+
+**Orchestrator**:
+- Fan-in coordination uses Redis Lua scripts with atomic operations, supporting multiple orchestrators
+- Consumer groups on the results stream allow multiple orchestrators to process results
+- Stale result claiming enables orchestrators to take over work from failed instances
+- **Load balancing required**: When running multiple orchestrators, a load balancer (e.g., nginx, or cloud LB) must be placed in front to distribute API requests across instances
+
+**Future Enhancement**: For full high availability, consider adding:
+- Leader election for orchestrator (e.g., using Redis or etcd) to coordinate recovery and checkpointing
+- Health-based load balancing across orchestrator instances
+
+
+### Distributed Recovery Coordination
+
+**Current State**: The crash recovery process has no distributed coordination mechanism. When an orchestrator starts, it independently queries PostgreSQL for incomplete workflows and attempts to recover them.
+
+**Problem**: With multiple orchestrators running simultaneously:
+- Multiple orchestrators could attempt to recover the same workflow concurrently
+- This could lead to duplicate node dispatches and task execution
+- Fan-in counters could be corrupted by concurrent recovery attempts
+- Checkpoint writes could conflict, causing state inconsistencies
+
+**Future Enhancement**: Consider implementing distributed locks for recovery coordination:
+
+**Leader Election** (for centralized recovery):
+   - Elect a single orchestrator as the recovery leader using Redis or etcd
+   - Only the leader performs recovery on startup
+   - Other orchestrators wait or handle only new workflow submissions
+   - Leader re-election on failure
+
+**Trade-offs**:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Leader election | Centralized control, no lock contention | Single recovery point, leader failure delays recovery |
 
 ---
 

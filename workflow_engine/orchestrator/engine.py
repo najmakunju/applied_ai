@@ -684,7 +684,21 @@ class WorkflowOrchestrator:
         is_retryable: bool,
         worker_id: str,
     ) -> None:
-        """Handle node failure."""
+        """
+        Handle node failure.
+        
+        Note: Retry logic is handled at the consumer/worker level. By the time
+        a failure reaches the orchestrator, all retries have been exhausted.
+        The orchestrator simply marks the node and workflow as failed.
+        
+        Args:
+            workflow_execution_id: The workflow execution ID
+            node_id: The failed node ID
+            error_message: Error description
+            error_type: Error class name
+            is_retryable: Whether the error was retryable (for logging only)
+            worker_id: ID of the worker that processed the task
+        """
         # Ensure execution is loaded (from memory, cache, or DB)
         execution, definition = await self._ensure_execution_loaded(workflow_execution_id)
         
@@ -707,38 +721,22 @@ class WorkflowOrchestrator:
             logger.warning(f"Node execution not found: {node_id}")
             return
         
-        parser = self._dag_parsers.get(definition.id)
-        retry_config = parser.get_node_effective_retry_config(node_id) if parser else definition.default_retry_config
+        # Mark node as failed
+        node_exec.state = NodeState.FAILED.value
+        node_exec.completed_at = datetime.utcnow()
+        node_exec.error_message = error_message
+        node_exec.error_type = error_type
+        node_exec.worker_id = worker_id
         
-        # Check if we should retry
-        if is_retryable and node_exec.attempt < retry_config.max_retries:
-            # Retry
-            node_exec.attempt += 1
-            node_exec.state = NodeState.PENDING.value
-            node_exec.error_message = error_message
-            
-            logger.info(
-                f"Retrying node {node_id}, attempt {node_exec.attempt}/{retry_config.max_retries}"
-            )
-            
-            # Re-dispatch
-            node = definition.dag.get_node(node_id)
-            if node:
-                await self._dispatch_node(execution, definition, node)
-        else:
-            # Mark as failed
-            node_exec.state = NodeState.FAILED.value
-            node_exec.completed_at = datetime.utcnow()
-            node_exec.error_message = error_message
-            node_exec.error_type = error_type
-            node_exec.worker_id = worker_id
-            
-            logger.error(f"Node {node_id} failed for execution {workflow_execution_id}")
-            
-            # Fail the workflow
-            execution.state = WorkflowState.FAILED.value
-            execution.completed_at = datetime.utcnow()
-            execution.error_message = f"Node {node_id} failed: {error_message}"
+        logger.error(
+            f"Node {node_id} failed for execution {workflow_execution_id}: "
+            f"{error_type}: {error_message}"
+        )
+        
+        # Fail the workflow
+        execution.state = WorkflowState.FAILED.value
+        execution.completed_at = datetime.utcnow()
+        execution.error_message = f"Node {node_id} failed: {error_message}"
         
         # Update cache
         await self.cache.cache_workflow_execution(

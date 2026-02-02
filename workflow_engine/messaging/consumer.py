@@ -11,17 +11,31 @@ Uses a semaphore-controlled task pool for production-grade concurrency:
 """
 
 import asyncio
+import json
 import logging
 from typing import Any, Callable, Optional
 
 import redis.asyncio as redis
 import redis.exceptions
 
+from uuid import UUID
+
 from workflow_engine.config import get_settings
 from workflow_engine.core.models import HandlerType, TaskResult
-from workflow_engine.messaging.broker import MessageBroker, TaskQueue
+from workflow_engine.messaging.broker import MessageBroker, ResultQueue, TaskQueue
+from workflow_engine.storage.redis.cache import RedisCache
 
 logger = logging.getLogger(__name__)
+
+# Errors that should not be retried - indicate bad data or configuration
+# These go directly to DLQ for investigation
+NON_RETRYABLE_ERRORS = (
+    ValueError,
+    TypeError,
+    KeyError,
+    AttributeError,
+    json.JSONDecodeError,
+)
 
 
 class TaskConsumer:
@@ -40,11 +54,19 @@ class TaskConsumer:
         broker: MessageBroker,
         consumer_id: str,
         queue_names: Optional[list[str]] = None,
+        result_queue: Optional[ResultQueue] = None,
+        cache: Optional[RedisCache] = None,
     ):
         self.broker = broker
         self.consumer_id = consumer_id
         self.queue_names = queue_names or ["tasks:default"]
         self.settings = get_settings()
+        
+        # Result queue for reporting failures to orchestrator
+        self._result_queue = result_queue
+        
+        # Cache for idempotency checks
+        self._cache = cache
         
         self._handlers: dict[str, Callable] = {}
         self._running = False
@@ -202,16 +224,61 @@ class TaskConsumer:
         msg_id: str,
         msg_data: dict[str, Any],
     ) -> None:
-        """Process a single message."""
+        """
+        Process a single message with proper error handling.
+        
+        Processing strategy:
+        1. Idempotency check: Skip if node already completed
+        2. No handler: Report failure to orchestrator + DLQ (misconfiguration)
+        3. Non-retryable error: Report failure to orchestrator + DLQ (bad data)
+        4. Retryable error with retries left: Re-queue with incremented attempt
+        5. Retryable error exhausted: Report failure to orchestrator (no DLQ)
+        
+        DLQ is reserved for messages needing manual investigation.
+        All failures are reported to orchestrator so it can fail the node.
+        """
+        # Idempotency check: Skip if node already completed
+        # This prevents duplicate processing after:
+        # - Worker crash and message re-delivery
+        # - Stale message claiming while handler is still running
+        # - Orchestrator recovery re-dispatching completed tasks
+        if self._cache:
+            try:
+                workflow_execution_id = UUID(msg_data["workflow_execution_id"])
+                node_id = msg_data["node_id"]
+                
+                is_completed = await self._cache.is_node_completed(
+                    workflow_execution_id, node_id
+                )
+                if is_completed:
+                    logger.info(
+                        f"Skipping duplicate task for already completed node: "
+                        f"workflow={workflow_execution_id}, node={node_id}"
+                    )
+                    # Just acknowledge and skip - work already done
+                    await queue.acknowledge(msg_id)
+                    return
+            except Exception as e:
+                # Log but don't fail - better to process potentially duplicate
+                # than to block on cache errors
+                logger.warning(f"Idempotency check failed, proceeding with task: {e}")
+        
         handler_type = msg_data.get("handler")
         
+        # Case 1: No handler registered → Report failure + DLQ
         if handler_type not in self._handlers:
+            error_msg = f"No handler registered for type: {handler_type}"
             logger.warning(f"No handler for type: {handler_type}")
-            await queue.reject(
-                msg_id,
+            
+            # Report to orchestrator so it can fail the node
+            await self._report_failure(
                 msg_data,
-                f"No handler registered for type: {handler_type}",
+                error_message=error_msg,
+                error_type="NoHandlerError",
             )
+            
+            # Move to DLQ for investigation (misconfiguration)
+            await queue.reject(msg_id, msg_data, error_msg, move_to_dlq=True)
             return
         
         handler = self._handlers[handler_type]
@@ -225,18 +292,53 @@ class TaskConsumer:
             
             logger.debug(f"Successfully processed message {msg_id}")
             
+        except NON_RETRYABLE_ERRORS as e:
+            # Case 2: Non-retryable error → Report failure + DLQ
+            error_msg = str(e)
+            logger.error(
+                f"Non-retryable error for message {msg_id}: {e}",
+                exc_info=True,
+            )
+            
+            # Report to orchestrator so it can fail the node
+            await self._report_failure(
+                msg_data,
+                error_message=error_msg,
+                error_type=type(e).__name__,
+            )
+            
+            # Move to DLQ for investigation (bad data)
+            await queue.reject(msg_id, msg_data, error_msg, move_to_dlq=True)
+            
         except Exception as e:
+            # Retryable error - check attempt count
+            error_msg = str(e)
             logger.error(f"Error processing message {msg_id}: {e}", exc_info=True)
             
-            # Check retry count
             attempt = int(msg_data.get("attempt", 1))
             max_retries = msg_data.get("retry_config", {}).get("max_retries", 3)
             
             if attempt >= max_retries:
-                # Move to DLQ
-                await queue.reject(msg_id, msg_data, str(e), move_to_dlq=True)
+                # Case 3: Retries exhausted → Report failure only (no DLQ)
+                logger.warning(
+                    f"Max retries ({max_retries}) exhausted for message {msg_id}, "
+                    f"reporting failure to orchestrator"
+                )
+                
+                # Report to orchestrator so it can fail the node
+                await self._report_failure(
+                    msg_data,
+                    error_message=error_msg,
+                    error_type=type(e).__name__,
+                )
+                
+                # Just acknowledge - no DLQ (normal failure after retries)
+                await queue.acknowledge(msg_id)
             else:
-                # Acknowledge and re-queue with incremented attempt
+                # Case 4: Retries remaining → Re-queue with incremented attempt
+                logger.info(
+                    f"Retrying message {msg_id} (attempt {attempt + 1}/{max_retries})"
+                )
                 await queue.acknowledge(msg_id)
                 
                 # Re-publish with incremented attempt
@@ -249,10 +351,47 @@ class TaskConsumer:
                     self._serialize_message(retry_data),
                 )
     
+    async def _report_failure(
+        self,
+        msg_data: dict[str, Any],
+        error_message: str,
+        error_type: str,
+    ) -> None:
+        """
+        Report task failure to orchestrator via result queue.
+        
+        This ensures the orchestrator knows the task failed and can
+        mark the node as failed, potentially failing the entire workflow.
+        """
+        if not self._result_queue:
+            logger.warning(
+                f"Cannot report failure for node {msg_data.get('node_id')}: "
+                "Result queue not configured"
+            )
+            return
+        
+        try:
+            await self._result_queue.publish_result(
+                workflow_execution_id=msg_data["workflow_execution_id"],
+                node_id=msg_data["node_id"],
+                success=False,
+                output_data=None,
+                error_message=error_message,
+                error_type=error_type,
+                is_retryable=False,  # We've either exhausted retries or it's non-retryable
+                worker_id=self.consumer_id,
+            )
+            logger.debug(
+                f"Reported failure for node {msg_data['node_id']} to orchestrator"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to report failure for node {msg_data.get('node_id')}: {e}",
+                exc_info=True,
+            )
+    
     def _serialize_message(self, data: dict[str, Any]) -> dict[str, str]:
         """Serialize message data for Redis."""
-        import json
-        
         result = {}
         for key, value in data.items():
             if isinstance(value, dict):

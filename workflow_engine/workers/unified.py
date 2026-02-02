@@ -111,6 +111,8 @@ class UnifiedWorker:
             broker=self._broker,
             consumer_id=self.worker_id,
             queue_names=self.queue_names,
+            result_queue=self._result_queue,
+            cache=self._cache,
         )
         
         # Register handlers
